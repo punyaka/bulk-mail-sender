@@ -266,7 +266,7 @@ with compose_tab:
                     logs.append({"email": email, "status": "Failed", "error": str(e)})
 
                 progress.progress((i + 1) / total)
-                time.sleep(1)  # pause before next email
+                time.sleep(10)  # pause before next email
 
             status_line.empty()
             st.session_state["logs"] = logs
