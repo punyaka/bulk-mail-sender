@@ -1,100 +1,46 @@
 """
-Streamlit Bulk-Mailer (Gmail API, no yagmail)
+Streamlit Bulk-Mailer (Resend API)
 ────────────────────────────────────────────
 • Excel mail-merge — tags {Name}, {Salutation}, … in subject & body
 • Quill editors for header / body / footer
 • Optional header / footer images
 • Per-row PDF (URL or local path)
-• Auth once via Google OAuth; token stored at ~/.credentials/gmail_token.pickle
+• Sends via Resend (resend.com) using an API key entered in the sidebar
 """
 
-import base64, mimetypes, pathlib, pickle, re
+import base64, pathlib, re
 from io import BytesIO
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-
-from email import encoders          # ‼️ add at top with other imports
 
 import pandas as pd
 import requests
 import streamlit as st
 from streamlit_quill import st_quill
 from jinja2 import Environment, Undefined, select_autoescape
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
 
 import time
 import gdown
 
 
-# ─── OAuth / Gmail helpers (from your Nexus Mailer) ───────────────────────────
-SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-TOKEN_PKL = pathlib.Path.home() / ".credentials" / "gmail_token.pickle"
-CLIENT_SECRET = pathlib.Path("client_secret.json")  # must exist
+# ─── Resend.com email helpers ──────────────────────────────────────────────────
+RESEND_API_URL = "https://api.resend.com/emails"
 
-def get_gmail_service():
-    TOKEN_PKL.parent.mkdir(parents=True, exist_ok=True)
-    creds = None
-    if TOKEN_PKL.exists():
-        creds = pickle.loads(TOKEN_PKL.read_bytes())
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-    if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
-        creds = flow.run_local_server(port=0)
-        TOKEN_PKL.write_bytes(pickle.dumps(creds))
-    return build("gmail", "v1", credentials=creds), creds
-
-def build_message(sender, to, subject, html_body, attachment=None):
-    """Return Gmail API message dict (handles one attachment or none)."""
+def send_via_resend(api_key, sender, to, subject, html_body, attachment=None):
+    """Send one email via the Resend API. attachment = (filename, bytes) or None."""
+    payload = {"from": sender, "to": [to], "subject": subject, "html": html_body}
     if attachment:
-        msg = MIMEMultipart()
-        msg.attach(MIMEText(html_body, "html"))
         fname, data = attachment
-        ctype, _ = mimetypes.guess_type(fname)
-        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
-        part = MIMEBase(maintype, subtype)
-        part.set_payload(data)
-        part.add_header("Content-Disposition", "attachment", filename=fname)
-        part.add_header("Content-Type", ctype or "application/octet-stream")
-        msg.attach(part)
-    else:
-        msg = MIMEText(html_body, "html")
-
-    msg["To"] = to
-    msg["From"] = sender
-    msg["Subject"] = subject
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    return {"raw": raw}
-
-def send_via_gmail(service, message):
-    return service.users().messages().send(userId="me", body=message).execute()
-
-def create_message_with_attachment(sender, to, subject, html_body, file_tuple):
-    filename, payload = file_tuple
-    message = MIMEMultipart()
-    message["To"] = to
-    message["From"] = sender
-    message["Subject"] = subject
-    message.attach(MIMEText(html_body, "html"))
-
-    ctype, _ = mimetypes.guess_type(filename)
-    maintype, subtype = (ctype or "application/pdf").split("/", 1)
-
-    part = MIMEBase(maintype, subtype)
-    if isinstance(payload, str):
-        payload = payload.encode()
-    part.set_payload(payload)
-
-    encoders.encode_base64(part)                                # ← NEW
-    part.add_header("Content-Type", ctype or "application/pdf")
-    part.add_header("Content-Disposition", "attachment", filename=filename)
-
-    message.attach(part)
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    return {"raw": raw}
+        payload["attachments"] = [{
+            "filename": fname,
+            "content": base64.b64encode(data).decode(),
+        }]
+    resp = requests.post(
+        RESEND_API_URL,
+        headers={"Authorization": f"Bearer {api_key}"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ─── Jinja env (single-brace tags) ─────────────────────────────────────────────
@@ -178,9 +124,26 @@ st.markdown(
     """
 )
 
+SAMPLE_DF = pd.DataFrame([
+    {"Name": "Jane Doe", "Salutation": "Ms.", "Email": "jane@example.com", "PDF Link": ""},
+    {"Name": "John Smith", "Salutation": "Mr.", "Email": "john@example.com", "PDF Link": ""},
+])
+
+def sample_excel_bytes() -> bytes:
+    buf = BytesIO()
+    SAMPLE_DF.to_excel(buf, index=False)
+    return buf.getvalue()
+
 with st.sidebar:
+    st.download_button(
+        "⬇️ Download sample Excel",
+        data=sample_excel_bytes(),
+        file_name="sample_bulkmailer.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
     xlsx = st.file_uploader("Excel file", ["xlsx"])
-    sender = st.text_input("Sender Gmail address")
+    resend_api_key = st.text_input("Resend API key", type="password")
+    sender = st.text_input("Sender address (must be a verified Resend domain)")
     subj_tpl = st.text_input("Email Subject (tags OK)", "Hello {Name}")
     hdr_img = st.file_uploader("Header image", ["png","jpg","jpeg"])
     ftr_img = st.file_uploader("Footer image", ["png","jpg","jpeg"], key="ftr_img")
@@ -189,7 +152,7 @@ with st.sidebar:
         "Width for images & text (px)",
         min_value=200, max_value=1200, value=600, step=20
     )
-    st.info("First send will open Google consent screen; token is cached.")
+    st.info("Sending via Resend — get your API key at resend.com/api-keys")
 
 # ─── Excel / tags ─────────────────────────────────────────────────────────────
 df, TAGS = None, []
@@ -199,107 +162,134 @@ if xlsx:
     TAGS = df.columns.tolist()
     st.sidebar.markdown("Tags: " + " ".join(f"`{{{t}}}`" for t in TAGS))
 
+compose_tab, status_tab = st.tabs(["✉️ Compose", "📊 Status"])
+
 # ─── Editors ──────────────────────────────────────────────────────────────────
-st.markdown("### Header"); header_html = st_quill(html=True, key="hdr")
-st.markdown("### Body");   body_html   = st_quill(html=True, key="bdy")
-st.markdown("### Footer"); footer_html = st_quill(html=True, key="ftr")
+with compose_tab:
+    st.markdown("### Header"); header_html = st_quill(html=True, key="hdr")
+    st.markdown("### Body");   body_html   = st_quill(html=True, key="bdy")
+    st.markdown("### Footer"); footer_html = st_quill(html=True, key="ftr")
 
-preview_btn, send_btn = st.columns(2)
-preview_click = preview_btn.button("Preview first email")
-send_click    = send_btn.button("Send bulk emails")
+    preview_btn, send_btn = st.columns(2)
+    preview_click = preview_btn.button("Preview first email")
+    send_click    = send_btn.button("Send bulk emails")
 
-# clean editor output
-header_html = inline_p_spacing(
-    fix_inline_img_widths(clean_quill(header_html), img_width)
-)
-body_html   = inline_p_spacing(
-    fix_inline_img_widths(clean_quill(body_html), img_width)
-)
-footer_html = inline_p_spacing(
-    fix_inline_img_widths(clean_quill(footer_html), img_width)
-)
+    # clean editor output
+    header_html = inline_p_spacing(
+        fix_inline_img_widths(clean_quill(header_html), img_width)
+    )
+    body_html   = inline_p_spacing(
+        fix_inline_img_widths(clean_quill(body_html), img_width)
+    )
+    footer_html = inline_p_spacing(
+        fix_inline_img_widths(clean_quill(footer_html), img_width)
+    )
 
-hdr_tag = to_img_tag(hdr_img, img_width, br_after=True)
-ftr_tag = "<br>" + to_img_tag(ftr_img, img_width) if ftr_img else ""
+    hdr_tag = to_img_tag(hdr_img, img_width, br_after=True)
+    ftr_tag = "<br>" + to_img_tag(ftr_img, img_width) if ftr_img else ""
 
-# after you compute img_width
-style_tag = (
-    "{% raw %}"
-    "<style>"
-    f".mail-preview p {{margin:0 0 0em 0;line-height:1.4;}}"
-    "</style>"
-    "{% endraw %}"
-)
+    # after you compute img_width
+    style_tag = (
+        "{% raw %}"
+        "<style>"
+        f".mail-preview p {{margin:0 0 0em 0;line-height:1.4;}}"
+        "</style>"
+        "{% endraw %}"
+    )
 
-wrapper_start = (
-    f'<div class="mail-preview" '
-    f'style="max-width:{img_width}px;margin:0 auto;">'
-)
+    wrapper_start = (
+        f'<div class="mail-preview" '
+        f'style="max-width:{img_width}px;margin:0 auto;">'
+    )
 
-body_template = (
-    style_tag +
-    wrapper_start +
-    hdr_tag +
-    header_html + body_html + footer_html +
-    ftr_tag +
-    '</div>'
-)
+    body_template = (
+        style_tag +
+        wrapper_start +
+        hdr_tag +
+        header_html + body_html + footer_html +
+        ftr_tag +
+        '</div>'
+    )
 
-subj_template = jinja_env.from_string(subj_tpl)
+    subj_template = jinja_env.from_string(subj_tpl)
 
-# ─── Preview ──────────────────────────────────────────────────────────────────
-if preview_click and df is not None:
-    sample = df.iloc[0].to_dict()
-    st.markdown(f"**Subject:** {subj_template.render(**sample)}")
-    st.markdown(jinja_env.from_string(body_template).render(**sample),
-                unsafe_allow_html=True)
+    # ─── Preview ────────────────────────────────────────────────────────────
+    if preview_click and df is not None:
+        sample = df.iloc[0].to_dict()
+        st.markdown(f"**Subject:** {subj_template.render(**sample)}")
+        st.markdown(jinja_env.from_string(body_template).render(**sample),
+                    unsafe_allow_html=True)
 
-# ─── Bulk send ────────────────────────────────────────────────────────────────
-if send_click:
-    if df is None or not sender:
-        st.error("Please provide Excel file **and** sender address.")
-    else:
-        service, creds = get_gmail_service()
-        logs = []
-        st.info("Sending…")
-        for _, row in df.iterrows():
-            data = row.to_dict()
-            html = jinja_env.from_string(body_template).render(**data)
-            subj = subj_template.render(**data)
+    # ─── Bulk send ──────────────────────────────────────────────────────────
+    if send_click:
+        if df is None or not sender or not resend_api_key:
+            st.error("Please provide Excel file, sender address, **and** Resend API key.")
+        else:
+            logs = []
+            progress = st.progress(0.0)
+            status_line = st.empty()
+            total = len(df)
+            for i, (_, row) in enumerate(df.iterrows()):
+                data = row.to_dict()
+                email = data.get("Email", "")
+                status_line.info(f"Sending {i + 1}/{total}: {email}")
+                html = jinja_env.from_string(body_template).render(**data)
+                subj = subj_template.render(**data)
 
-            # optional one attachment
-            attach = None
-            pdf = str(data.get("PDF Link","")).strip()
-            if pdf:
+                # optional one attachment
+                attach = None
+                pdf_raw = data.get("PDF Link", "")
+                pdf = "" if pd.isna(pdf_raw) else str(pdf_raw).strip()
+                if pdf:
+                    try:
+                        if pdf.lower().startswith("http"):
+                            tmp_path = gdown.download(pdf, quiet=True)
+                            fname = pathlib.Path(tmp_path).name
+                            if not fname.lower().endswith(".pdf"):
+                                fname += ".pdf"                       # force .pdf so Gmail knows it
+                            filebytes = pathlib.Path(tmp_path).read_bytes()
+                            attach = (fname, filebytes)
+                        else:
+                            filebytes = pathlib.Path(pdf).read_bytes()
+                            attach = (pathlib.Path(pdf).name, filebytes)
+                    except Exception as e:
+                        logs.append({"email": email, "status": "Failed",
+                                     "error": f"PDF err: {e}"})
+                        progress.progress((i + 1) / total)
+                        continue
+
                 try:
-                    if pdf.lower().startswith("http"):
-                        tmp_path = gdown.download(pdf, quiet=True)
-                        fname = pathlib.Path(tmp_path).name
-                        if not fname.lower().endswith(".pdf"):
-                            fname += ".pdf"                       # force .pdf so Gmail knows it
-                        filebytes = pathlib.Path(tmp_path).read_bytes()
-                        attach = (fname, filebytes)
-                    else:
-                        filebytes = pathlib.Path(pdf).read_bytes()
-                        attach = (pathlib.Path(pdf).name, filebytes)
+                    send_via_resend(resend_api_key, sender, email,
+                                     subj, html, attach)
+                    logs.append({"email": email, "status": "Sent", "error": ""})
                 except Exception as e:
-                    logs.append({"email": data.get("Email",""),
-                                 "status": f"PDF err: {e}"})
-                    continue
+                    logs.append({"email": email, "status": "Failed", "error": str(e)})
 
-            message = (create_message_with_attachment(sender,
-                                                      data.get("Email",""),
-                                                      subj, html, attach)
-                        if attach else
-                        build_message(sender, data.get("Email",""), subj, html))
+                progress.progress((i + 1) / total)
+                time.sleep(1)  # pause before next email
 
-            try:
-                send_via_gmail(service, message)
-                logs.append({"email": data.get("Email",""), "status": "Sent"})
-            except Exception as e:
-                logs.append({"email": data.get("Email",""), "status": f"Err: {e}"})
+            status_line.empty()
+            st.session_state["logs"] = logs
+            st.success("Done — see the Status tab for a full breakdown.")
 
-            time.sleep(1)  # pause before next email
+# ─── Status ─────────────────────────────────────────────────────────────────
+with status_tab:
+    logs = st.session_state.get("logs")
+    if not logs:
+        st.info("No emails sent yet this session.")
+    else:
+        log_df = pd.DataFrame(logs)
+        sent_n = (log_df["status"] == "Sent").sum()
+        failed_n = (log_df["status"] == "Failed").sum()
 
-        st.success("Done")
-        st.write(pd.DataFrame(logs))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total", len(log_df))
+        c2.metric("Sent", sent_n)
+        c3.metric("Failed", failed_n)
+
+        if failed_n:
+            st.markdown("#### ❌ Failed")
+            st.dataframe(log_df[log_df["status"] == "Failed"], use_container_width=True)
+
+        st.markdown("#### Full log")
+        st.dataframe(log_df, use_container_width=True)
