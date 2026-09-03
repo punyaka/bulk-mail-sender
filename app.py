@@ -39,7 +39,12 @@ def send_via_resend(api_key, sender, to, subject, html_body, attachment=None):
         json=payload,
         timeout=30,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        try:
+            detail = resp.json().get("message", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise RuntimeError(f"{resp.status_code}: {detail}")
     return resp.json()
 
 
